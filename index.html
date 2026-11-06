@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#153e35">
+  <meta name="description" content="Настольная экономическая игра для компании. Играйте на общем экране или управляйте со своих телефонов.">
+
+  <title>Монополия — за одним столом</title>
+
+  <link rel="icon" href="./favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+
+<body>
+  <header class="topbar">
+    <a href="./" class="brand" aria-label="На главную">
+      <span class="brand-icon">M</span>
+      <span>
+        МОНОПОЛИЯ
+        <small>ЗА ОДНИМ СТОЛОМ</small>
+      </span>
+    </a>
+
+    <div class="top-right">
+      <span id="connection" class="connection">Локальная игра</span>
+
+      <button
+        class="icon-btn"
+        id="sound"
+        aria-label="Включить звук"
+      >♫</button>
+
+      <button
+        class="icon-btn"
+        id="help"
+        aria-label="Правила игры"
+      >?</button>
+
+      <button
+        class="icon-btn"
+        id="menu"
+        aria-label="Меню"
+      >☰</button>
+    </div>
+  </header>
+
+  <main id="app"></main>
+
+  <dialog id="modal">
+    <div class="modal-head">
+      <h2 id="modal-title"></h2>
+
+      <button
+        class="icon-btn"
+        id="close-modal"
+        aria-label="Закрыть окно"
+      >×</button>
+    </div>
+
+    <div id="modal-body"></div>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="./assets/qrcode.js"></script>
+  <script type="module" src="./app.js"></script>
+
+  <noscript>
+    Для игры необходимо включить JavaScript в браузере.
+  </noscript>
+</body>
+</html>
