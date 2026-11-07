@@ -5,7 +5,9 @@ import {
   RULES_VERSION
 } from './data.js';
 
-const copy = value => structuredClone(value);
+const copy = value => typeof structuredClone === 'function'
+  ? structuredClone(value)
+  : JSON.parse(JSON.stringify(value));
 
 const assert = (condition, message) => {
   if (!condition) {
