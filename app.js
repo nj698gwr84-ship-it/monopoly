@@ -8,6 +8,7 @@ import {
 } from './shared/engine.js';
 
 import { CONFIG } from './config.js';
+import { tileBounds, cameraPose, propertyScene, decisionKey, transitionInfo, icon, pieceIcon } from './shared/view.js';
 
 const $ = selector => document.querySelector(selector);
 const app = $('#app');
@@ -50,7 +51,19 @@ let online = [];
 let busy = false;
 let retry = null;
 let manualClose = false;
-let camera = read('mtv-camera', 'angle');
+let camera = read('mtv-camera', 'flat') === 'follow' ? 'follow' : 'flat';
+let zoom = 1;
+let fitFrame = 0;
+const wideScreen = matchMedia('(min-width: 640px) and (orientation: landscape)');
+let boardPan = { x: 0, y: 0 };
+let drag = null;
+let suppressBoardClick = false;
+let lastRenderedState = null;
+let lastDecision = null;
+let eventTimer = null;
+let eventStory = [];
+let eventPlayer = null;
+let eventBalance = null;
 let selected = null;
 let modalKind = null;
 let sound = read('mtv-sound', false);
@@ -156,13 +169,14 @@ function cmdBtn(
       class="${className}"
       data-command="${type}"
       ${attrs}
-      ${disabled ? 'disabled' : ''}
+      ${disabled || busy ? 'disabled' : ''}
     >${label}</button>
   `;
 }
 
 function openModal(title, html, kind = 'custom') {
   modalKind = kind;
+  $('#modal').classList.toggle('event-modal', kind === 'event');
   $('#modal-title').textContent = title;
   $('#modal-body').innerHTML = html;
 
@@ -250,139 +264,142 @@ $('#menu').onclick = () => {
   `);
 };
 
-function coords(index) {
-  if (index <= 10) return [11, 11 - index];
-  if (index <= 20) return [21 - index, 1];
-  if (index <= 30) return [1, index - 19];
-  return [index - 29, 11];
-}
-
-const symbols = {
-  start: '↗',
-  jail: '▦',
-  parking: 'P',
-  gotojail: '↪',
-  chance: '?',
-  chest: '▣',
-  rail: '♜',
-  utility: '⚙',
-  tax: '◇'
-};
-
 function board(state, hero = false) {
   const active = current(state);
-  const p = actor(state) || active;
-  const xy = p ? coords(p.position) : [11, 11];
-
+  // Аукцион и долг не перемещают камеру от фигурки ходящего игрока.
+  const tracked = active || state.players[0];
+  const yaw = !hero && camera === 'follow'
+    ? [90, 0, -90, 180][Math.floor((tracked?.position || 0) / 10)] : 0;
+  const quarterTurn = Math.abs(yaw) === 90;
   const tiles = BOARD.map((cell, index) => {
-    const [row, col] = coords(index);
-    const property = state.properties[index];
-
-    const owner = state.players.find(
-      item => item.id === property.owner
-    );
-
-    const here = state.players.filter(
-      item => !item.bankrupt && item.position === index
-    );
-
-    const tokens = here.map((item, number) => `
-      <span
-        class="token ${
-          item.id === active?.id && !hero ? 'active' : ''
-        }"
-        data-token="${esc(item.id)}"
-        title="${esc(item.name)}"
-        style="
-          --token-color:${COLORS[item.token]};
-          --dx:${here.length > 1 ? (number % 3 - 1) * 11 : 0}px;
-          --dy:${Math.floor(number / 3) * 10}px
-        "
-      >${TOKENS[item.token]}</span>
-    `).join('');
-
-    const buildings = property.houses ? `
-      <span class="buildings">
-        ${property.houses === 5
-          ? '<i class="house hotel"></i>'
-          : '<i class="house"></i>'.repeat(property.houses)}
-      </span>
-    ` : '';
-
+    const b = tileBounds(index);
+    const item = state.properties[index];
+    const owner = state.players.find(p => p.id === item.owner);
+    const here = state.players.filter(p => !p.bankrupt && p.position === index);
+    const label = ({chest: 'Казна', gotojail: 'В тюрьму', jail: 'Тюрьма / гости', parking: 'Стоянка'})[cell.type] || cell.name;
+    const art = cell.type === 'utility' && index === 28 ? 'water' : cell.type;
+    const scene = propertyScene(cell, index);
+    const illustration = scene === null
+      ? icon(art)
+      : `<span class="tile-scene" aria-hidden="true" style="background-position:${scene % 4 * 100 / 3}% ${Math.floor(scene / 4) * 100 / 3}%"></span>`;
     return `
-      <button
-        class="
-          tile ${cell.type}
-          ${index % 10 === 0 ? 'corner' : ''}
-          ${property.owner ? 'owned' : ''}
-          ${property.mortgaged ? 'mortgaged' : ''}
-          ${selected === index ? 'selected' : ''}
-        "
-        style="
-          grid-row:${row};
-          grid-column:${col};
-          --group:${GROUP_COLORS[cell.group] || '#9eae8c'};
-          --owner:${owner ? COLORS[owner.token] : 'transparent'}
-        "
-        data-action="property"
-        data-index="${index}"
-        aria-label="${
-          esc(cell.name)
-        }${cell.price ? ', цена ' + cell.price : ''}${
-          owner ? ', владелец ' + esc(owner.name) : ''
-        }"
-      >
-        ${cell.type === 'street'
-          ? '<span class="stripe"></span>'
-          : `<span class="tile-icon">${
-              symbols[cell.type] || '◆'
-            }</span>`}
-
-        <span class="tile-name">${esc(cell.name)}</span>
-
-        ${cell.price
-          ? `<span class="tile-price">${money(cell.price)}</span>`
-          : ''}
-
-        ${buildings}
-        ${tokens}
-      </button>
-    `;
+      <button class="tile ${cell.type} ${(quarterTurn ? b.height > b.width : b.width > b.height) ? 'wide-face' : 'tall-face'} ${index % 10 === 0 ? 'corner' : ''}
+        ${item.owner ? 'owned' : ''} ${item.mortgaged ? 'mortgaged' : ''}
+        ${tracked?.position === index && !hero ? 'occupied' : ''}"
+        style="grid-row:${b.row};grid-column:${b.col};
+          --group:${GROUP_COLORS[cell.group] || '#1c8178'};
+          --owner:${owner ? COLORS[owner.token] : 'transparent'};
+          --face-width:${(quarterTurn ? b.height : b.width) - 14}px;
+          --face-height:${(quarterTurn ? b.width : b.height) - 14}px"
+        data-action="property" data-index="${index}"
+        aria-label="${esc(cell.name)}${cell.price ? ', цена ' + cell.price : ''}${owner ? ', владелец ' + esc(owner.name) : ''}">
+        <span class="tile-number">${index === 0 ? 'СТАРТ' : index}</span>
+        ${cell.type === 'street' ? '<span class="stripe"></span>' : ''}
+        <span class="tile-content">
+          <span class="tile-art">${illustration}</span>
+          <span class="tile-name">${esc(label).replace(/([А-Яа-яЁё]{4})(?=[А-Яа-яЁё]{3})/g, '$1&shy;')}</span>
+          ${cell.price || cell.amount ? `<span class="tile-price">${money(cell.price || cell.amount)} <span class="gold-coin" aria-label="золота"></span></span>` : ''}
+          ${item.mortgaged ? '<span class="mortgage-label">ЗАЛОГ</span>' : ''}
+        </span>
+        ${item.houses ? `<span class="buildings" aria-label="${item.houses === 5 ? 'Отель' : 'Домов: ' + item.houses}">
+          ${item.houses === 5 ? '<i class="house hotel"><b>H</b></i>' : '<i class="house"></i>'.repeat(item.houses)}
+        </span>` : ''}
+        ${here.map((p, n) => `<span class="token ${p.id === active?.id && !hero ? 'active' : ''}"
+          data-token="${esc(p.id)}" title="${esc(p.name)}"
+          style="--token-color:${COLORS[p.token]};--dx:${(n % 3 - (Math.min(here.length, 3) - 1) / 2) * 24}px;--dy:${Math.floor(n / 3) * 26}px">
+          ${pieceIcon(p.token)}<span class="token-name">${esc(p.name)}</span></span>`).join('')}
+      </button>`;
   }).join('');
-
-  return `
-    <div
-      class="stage
-        ${!hero && camera === 'flat' ? 'flat' : ''}
-        ${!hero && camera === 'follow' ? 'follow' : ''}
-      "
-      style="--cx:${(6 - xy[1]) * 2}%;--cy:${(6 - xy[0]) * 2}%"
-    >
-      <div class="board-wrap">
-        <div class="board">
-          <div class="board-center">
-            <div class="center-city">
-              ${[35, 60, 48, 80, 50, 32].map(height => `
-                <i class="skyline" style="height:${height}px"></i>
-              `).join('')}
-            </div>
-
-            <div class="center-title">
-              МОНОПОЛИЯ
-              <small>ЗА ОДНИМ СТОЛОМ</small>
-            </div>
-
-            <div class="center-caption">
-              БОЛЬШИЕ ПЛАНЫ. ВАШ ХОД.
-            </div>
-          </div>
-
-          ${tiles}
-        </div>
-      </div>
-    </div>
-  `;
+  return `<div class="stage ${hero ? 'hero-stage' : camera}" data-track="${tracked?.position || 0}"
+      role="region" aria-label="Игровое поле. Нажмите клетку, чтобы открыть её карточку."
+      style="--yaw:${yaw}deg;--counter-yaw:${-yaw}deg">
+    <div class="table-surface"></div>
+    <div class="board-wrap"><div class="board">
+      <div class="board-center">
+        <div class="center-title"><span>МОНОПОЛИЯ</span><small>КОРОЛЕВСТВО</small></div>
+        <div class="center-decks"><span>${icon('chance')}<b>ШАНС</b></span><span>${icon('chest')}<b>КАЗНА</b></span></div>
+      </div>${tiles}
+    </div></div>
+  </div>`;
 }
+
+function fitBoards() {
+  const expanded = document.body.classList.contains('table-expanded');
+
+  for (const stage of app.querySelectorAll('.stage')) {
+    const hero = stage.classList.contains('hero-stage');
+    if (!hero) {
+      const top = stage.getBoundingClientRect().top;
+      const pageTop = expanded ? top : top + window.scrollY;
+      const limit = Math.max(100, Math.floor(window.innerHeight - pageTop - 20));
+      const height = expanded || wideScreen.matches
+        ? limit
+        : Math.min(Math.max(stage.clientWidth + 20, 280), 620);
+      stage.style.height = height + 'px';
+    }
+
+    const width = stage.clientWidth;
+    const height = stage.clientHeight;
+    if (!width || !height) continue;
+
+    const view = hero ? 'flat' : camera;
+    const scale = hero ? 1 : zoom;
+    const pose = cameraPose(Number(stage.dataset.track), view, width, height, scale);
+    const canPan = !hero && (view === 'follow' || scale > 1);
+    stage.style.setProperty('--board-scale', pose.scale);
+    stage.style.setProperty('--drag-x', (canPan ? boardPan.x : 0) + 'px');
+    stage.style.setProperty('--drag-y', (canPan ? boardPan.y : 0) + 'px');
+    stage.style.setProperty('--tilt', pose.tilt + 'deg');
+    stage.style.setProperty('--pan-x', pose.x + 'px');
+    stage.style.setProperty('--pan-y', pose.y + 'px');
+    stage.classList.toggle('compact-board', pose.scale < 0.5);
+    stage.classList.toggle('can-pan', canPan);
+    // На браузерах без overflow: clip фокус может сдвинуть содержимое.
+    stage.scrollTop = 0;
+    stage.scrollLeft = 0;
+  }
+}
+
+function scheduleFit() {
+  if (fitFrame) return;
+  fitFrame = requestAnimationFrame(() => {
+    fitFrame = 0;
+    fitBoards();
+  });
+}
+
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(scheduleFit).observe(app);
+}
+window.addEventListener('resize', scheduleFit);
+window.visualViewport?.addEventListener('resize', scheduleFit);
+app.addEventListener('scroll', event => {
+  const stage = event.target;
+  if (stage.classList?.contains('stage')) {
+    stage.scrollTop = 0;
+    stage.scrollLeft = 0;
+  }
+}, true);
+
+document.addEventListener('pointerdown', event => {
+  const stage = event.target.closest('.stage:not(.hero-stage)');
+  if (!stage?.classList.contains('can-pan') || event.button !== 0) return;
+  drag = { stage, id: event.pointerId, x: event.clientX, y: event.clientY, pan: { ...boardPan }, moved: false };
+});
+document.addEventListener('pointermove', event => {
+  if (!drag?.stage.isConnected || drag.id !== event.pointerId) return;
+  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+  if (!drag.moved && Math.hypot(dx, dy) < 8) return;
+  drag.moved = true;
+  drag.stage.setPointerCapture?.(event.pointerId);
+  boardPan = { x: drag.pan.x + dx, y: drag.pan.y + dy };
+  fitBoards();
+});
+document.addEventListener('pointerup', () => {
+  if (drag?.moved) { suppressBoardClick = true; setTimeout(() => { suppressBoardClick = false; }, 100); }
+  drag = null;
+});
+document.addEventListener('pointercancel', () => { drag = null; });
 
 function demo() {
   let state = newGame();
@@ -422,6 +439,11 @@ function demo() {
 function home() {
   mode = 'home';
   s = null;
+  clearTimeout(eventTimer);
+  lastRenderedState = null;
+  lastDecision = null;
+  eventStory = [];
+  document.body.classList.remove('in-game', 'table-expanded');
 
   app.innerHTML = `
     <section class="home">
@@ -498,12 +520,17 @@ function home() {
     </p>
   `;
 
+  fitBoards();
   connection();
 }
 
 function newLocal() {
   closeConnection();
   mode = 'local';
+  lastRenderedState = null;
+  lastDecision = null;
+  eventStory = [];
+  eventBalance = null;
   s = newGame();
 
   s = addPlayer(s, {
@@ -557,7 +584,7 @@ function lobby() {
       <span
         class="mini-token"
         style="--c:${COLORS[p.token]}"
-      >${TOKENS[p.token]}</span>
+      >${pieceIcon(p.token)}</span>
 
       <div>
         <strong>${esc(p.name)}</strong>
@@ -793,7 +820,7 @@ function tradeDescription(trade) {
   `;
 }
 
-function turnCard() {
+function turnContent() {
   const p = actor(s) || current(s);
   const mine = controls(p.id);
   const trade = s.trade;
@@ -1013,6 +1040,15 @@ function turnCard() {
     `;
   }
 
+  return content;
+}
+
+function turnCard() {
+  const p = actor(s) || current(s);
+  const content = (s.phase === 'roll' && !s.trade) || s.paused ? turnContent() : `
+    <div class="turn-brief">${esc(BOARD[current(s).position].name)}</div>
+    <button class="primary wide" data-action="event">Открыть карточку хода</button>`;
+
   return `
     <div class="card turn-card ${busy ? 'rolling' : ''}">
       <span class="turn-number">РАУНД ${s.round}</span>
@@ -1030,7 +1066,7 @@ function turnCard() {
         <span
           class="mini-token"
           style="--c:${COLORS[p.token]};margin-left:auto"
-        >${TOKENS[p.token]}</span>
+        >${pieceIcon(p.token)}</span>
       </div>
 
       <div class="muted">
@@ -1040,19 +1076,6 @@ function turnCard() {
 
       ${diceHTML()}
 
-      ${s.card ? `
-        <p
-          class="small"
-          style="
-            line-height:1.6;
-            border-top:1px solid #ffffff20;
-            padding-top:12px
-          "
-        >
-          ${s.card.kind === 'chance' ? 'ШАНС' : 'КАЗНА'}
-          · ${esc(s.card.text)}
-        </p>
-      ` : ''}
 
       ${content}
     </div>
@@ -1068,7 +1091,7 @@ function playersCard() {
       "
       style="--c:${COLORS[p.token]}"
     >
-      <span class="avatar">${TOKENS[p.token]}</span>
+      <span class="avatar">${pieceIcon(p.token)}</span>
 
       <div>
         <div class="player-name">
@@ -1137,107 +1160,146 @@ function playersCard() {
   `;
 }
 
+function cameraControls() {
+  const expanded = document.body.classList.contains('table-expanded');
+  return `<div class="camera-toolbar">
+    <div class="view-controls" role="group" aria-label="Режим камеры">
+      ${[['flat', 'Всё поле'], ['follow', 'За фигуркой']].map(([value, label]) => `
+        <button class="${camera === value ? 'chosen' : ''}" data-action="camera" data-camera="${value}"
+          aria-pressed="${camera === value}">${label}</button>`).join('')}
+    </div>
+    <div class="zoom-controls" role="group" aria-label="Масштаб поля">
+      <button data-action="zoom-out" aria-label="Уменьшить поле" ${zoom <= 0.8 ? 'disabled' : ''}>−</button>
+      <button data-action="zoom-reset" aria-label="Сбросить масштаб">${Math.round(zoom * 100)}%</button>
+      <button data-action="zoom-in" aria-label="Увеличить поле" ${zoom >= 2 ? 'disabled' : ''}>+</button>
+      <button data-action="fullscreen" aria-pressed="${expanded}">${expanded ? 'Выйти из ТВ' : 'Режим ТВ'}</button>
+    </div>
+  </div>`;
+}
+
 function game() {
   const stock = bankStock(s);
-
-  const heading = `
-    <div class="table-head">
-      <div>
-        <div class="eyebrow">
-          ${session
-            ? 'КОМНАТА ' + session.code
-            : 'ВЕЧЕР ЗА ОДНИМ СТОЛОМ'}
-        </div>
-        <h2>Город начинается с вас.</h2>
-      </div>
-
-      <div class="view-controls" aria-label="Камера">
-        ${[
-          ['angle', '3D'],
-          ['flat', 'Сверху'],
-          ['follow', 'Ближе']
-        ].map(([value, text]) => `
-          <button
-            class="${camera === value ? 'chosen' : ''}"
-            data-action="camera"
-            data-camera="${value}"
-          >${text}</button>
-        `).join('')}
-      </div>
+  const p = current(s);
+  const table = `<section class="table-panel">
+    <div class="table-head"><div><span class="eyebrow">${session ? 'КОМНАТА ' + session.code : 'ЗА ОДНИМ СТОЛОМ'}</span>
+      <h2>Ходит ${esc(p.name)}</h2></div><span class="round-chip">Раунд ${s.round}</span></div>
+    ${cameraControls()}
+    ${board(s)}
+    <div class="location-strip" style="--c:${COLORS[p.token]}">
+      <span class="location-piece">${pieceIcon(p.token)}</span>
+      <div><span class="eyebrow">${esc(p.name)} · КЛЕТКА ${p.position}</span>
+        <strong>${esc(BOARD[p.position].name)}</strong></div>
+      <button class="secondary" data-action="property" data-index="${p.position}">Подробнее</button>
     </div>
-  `;
+    <div class="board-footer"><span>Нажмите клетку — откроется крупная карточка</span>
+      <span>Банк: ${stock.houses} домов · ${stock.hotels} отелей</span></div>
+  </section>`;
+  return `<div class="layout ${session?.role === 'player' ? 'personal-layout' : ''}">
+    ${session?.role === 'player' ? `<div class="personal-heading"><b>Ваш пульт · ${esc(me()?.name || 'Игрок')}</b>
+      <button class="secondary" data-action="room">Комната ${session.code}</button></div>` : ''}
+    ${table}
+    <aside class="sidebar">${turnCard()}${playersCard()}</aside>
+    <section class="activity"><div><div class="activity-label">ХРОНИКА ИГРЫ</div>
+      <button class="secondary" data-action="log">Все события</button></div>
+      <div class="activity-list">${s.log.slice(-3).reverse().map(text => `<div class="activity-item">${esc(text)}</div>`).join('')}</div>
+    </section></div>`;
+}
 
-  if (session?.role === 'player') {
-    return `
-      <div class="phone-screen">
-        <div class="row between">
-          <div class="eyebrow">
-            ВАШ ПУЛЬТ · ${esc(me()?.name || 'Игрок')}
-          </div>
-
-          <button
-            class="secondary"
-            data-action="room"
-            style="padding:7px"
-          >${session.code}</button>
-        </div>
-
-        ${board(s)}
-        ${turnCard()}
-        ${playersCard()}
-      </div>
-    `;
+function eventCard() {
+  if (!s || s.status !== 'playing' || (s.phase === 'roll' && !s.trade)) return;
+  const mover = current(s);
+  const p = actor(s) || mover;
+  const cell = BOARD[mover.position];
+  const item = s.properties[mover.position];
+  const owner = s.players.find(person => person.id === item.owner);
+  const debt = s.debt;
+  const auction = s.auction;
+  const eventCell = auction ? BOARD[auction.index] : cell;
+  const descriptions = {
+    start: 'Старт приносит 200 при прохождении или остановке.',
+    parking: 'Бесплатная стоянка. Можно отдохнуть и передать ход.',
+    jail: mover.jailed ? 'Вы в тюрьме. Со следующего хода можно выйти за 50, по карточке или выбросив дубль.' : 'Вы в гостях. Платить и пропускать ход не нужно.',
+    gotojail: 'Отправляйтесь в тюрьму. Выплаты за Старт нет.'
+  };
+  let title = eventCell.name;
+  let category = 'РЕЗУЛЬТАТ ХОДА';
+  let amount = '';
+  let description = descriptions[cell.type] || '';
+  if (s.trade) { title = 'Предложение обмена'; category = 'СДЕЛКА'; }
+  else if (debt) {
+    category = 'НУЖНО ПОГАСИТЬ ДОЛГ'; amount = money(debt.amount) + ' М';
+    description = `${p.name}: ${debt.note}. На счёте ${money(p.money)}. Продайте здания, заложите участок или предложите обмен.`;
+  } else if (auction) {
+    category = 'АУКЦИОН'; amount = money(auction.bid) + ' М';
+    description = `Сейчас ставку делает ${p.name}.`;
+  } else if (s.phase === 'buy') {
+    category = 'СВОБОДНАЯ СОБСТВЕННОСТЬ'; amount = money(cell.price) + ' М';
+    description = `Купить участок или отправить его на аукцион. На счёте ${money(mover.money)}.`;
+  } else if (cell.price) {
+    category = owner?.id === mover.id ? 'ВАША СОБСТВЕННОСТЬ' : item.mortgaged ? 'УЧАСТОК В ЗАЛОГЕ' : 'АРЕНДА';
+    description = owner?.id === mover.id ? 'Этот участок принадлежит вам. Можно управлять собственностью и завершить ход.'
+      : item.mortgaged ? 'Участок заложен. Аренда не взимается.'
+      : `Владелец: ${owner?.name || 'Банк'}. Результат платежа показан ниже.`;
+  } else if (cell.type === 'tax') {
+    category = 'НАЛОГ ОПЛАЧЕН'; amount = '−' + money(cell.amount) + ' М';
+    description = 'Платёж уже списан в банк. Повторная оплата не требуется.';
   }
+  const delta = eventPlayer === mover.id && eventBalance !== null ? mover.money - eventBalance : null;
+  const story = eventStory.filter(line => !/: выпало /.test(line)).slice(-12);
+  if (!debt && !auction && cell.price && owner?.id !== mover.id && !item.mortgaged) {
+    const paid = [...story].reverse().find(line => line.startsWith(mover.name + ' платит ') && line.includes('(аренда:'));
+    const value = paid?.match(/ платит (\d+)/)?.[1];
+    if (value) { amount = '−' + money(Number(value)) + ' М'; description = `Аренда перечислена игроку ${owner?.name || ''}. Повторная оплата не требуется.`; }
+  }
+  if (s.card && !debt && !auction && !amount && delta) amount = (delta > 0 ? '+' : '−') + money(Math.abs(delta)) + ' М';
+  const cardArt = s.card ? s.card.kind : eventCell.type === 'utility' && mover.position === 28 ? 'water' : eventCell.type;
+  openModal(title, `<article class="event-card" style="--event-color:${GROUP_COLORS[eventCell.group] || '#23796d'}">
+    <div class="event-kicker">${esc(category)}</div>
+    <div class="event-art">${icon(cardArt)}</div>
+    <div class="event-player"><span style="--c:${COLORS[mover.token]}">${pieceIcon(mover.token)}</span>
+      <b>${esc(mover.name)}</b><span>Кубики ${s.dice[0]} + ${s.dice[1]}</span></div>
+    ${amount ? `<div class="event-amount">${amount}</div>` : ''}
+    ${s.card ? `<div class="drawn-card"><b>${s.card.kind === 'chance' ? 'ШАНС' : 'ОБЩЕСТВЕННАЯ КАЗНА'}</b><p>${esc(s.card.text)}</p></div>` : ''}
+    <p class="event-description">${esc(description)}</p>
+    ${story.length ? `<details class="event-receipt"><summary>Подробности хода · ${story.length}</summary>${story.map(line => `<p>${esc(line)}</p>`).join('')}</details>` : ''}
+    <div class="event-balance"><span>На счёте <b>${money(mover.money)} М</b></span>
+      ${delta !== null && delta !== 0 ? `<strong class="${delta > 0 ? 'positive' : 'negative'}">${delta > 0 ? '+' : '−'}${money(Math.abs(delta))} М за ход</strong>` : ''}</div>
+    <div class="event-actions">${turnContent()}</div>
+    <button class="event-back" data-action="close-event">Посмотреть поле</button>
+  </article>`, 'event');
+}
 
-  return `
-    <div class="layout">
-      <section>
-        ${heading}
-        ${board(s)}
-
-        <div class="board-footer">
-          <div class="legend">
-            <span>
-              <i
-                class="dot"
-                style="--c:${COLORS[current(s).token]}"
-              ></i>
-              Подсвечена активная фигурка
-            </span>
-          </div>
-
-          <span>
-            Банк: ${stock.houses} домов ·
-            ${stock.hotels} отелей
-          </span>
-        </div>
-      </section>
-
-      <aside class="sidebar">
-        ${turnCard()}
-        ${playersCard()}
-      </aside>
-
-      <section class="activity">
-        <div>
-          <div class="activity-label">ХРОНИКА ИГРЫ</div>
-
-          <button
-            class="icon-btn"
-            data-action="log"
-            aria-label="Вся история"
-            style="margin-top:10px"
-          >↗</button>
-        </div>
-
-        <div class="activity-list">
-          ${s.log.slice(-3).reverse().map(text => `
-            <div class="activity-item">${esc(text)}</div>
-          `).join('')}
-        </div>
-      </section>
-    </div>
-  `;
+function syncEvent(previous) {
+  const info = transitionInfo(previous, s);
+  if (info.rolled) {
+    eventStory = info.lines;
+    const mover = current(s);
+    eventPlayer = mover?.id;
+    eventBalance = previous.players.find(p => p.id === mover?.id)?.money ?? null;
+  } else if (!previous && s.status === 'playing') {
+    let start = s.log.length - 1;
+    while (start >= 0 && !/: выпало \d \+ \d\./.test(s.log[start])) start--;
+    eventStory = start >= 0 ? s.log.slice(start) : [];
+    eventPlayer = current(s)?.id;
+    eventBalance = null;
+  } else if (info.lines.length && eventStory.length) eventStory.push(...info.lines);
+  if (eventStory.length > 20) eventStory = eventStory.slice(-20);
+  const key = decisionKey(s);
+  if (key === lastDecision) return;
+  lastDecision = key;
+  clearTimeout(eventTimer);
+  if (!key) {
+    if (modalKind === 'event') closeModal();
+    return;
+  }
+  if (modalKind === 'event') {
+    eventCard();
+    return;
+  }
+  eventTimer = setTimeout(() => {
+    // Не перекрываем открытые активы, обмен или справку.
+    if (decisionKey(s) === key && !$('#modal').open) eventCard();
+  }, info.moved || info.rolled ? 850 : 80);
 }
 
 function render() {
@@ -1247,10 +1309,14 @@ function render() {
   const key =
     focused?.dataset?.command || focused?.dataset?.action;
 
+  const previousState = lastRenderedState;
+  if (transitionInfo(previousState, s).moved) boardPan = { x: 0, y: 0 };
+  document.body.classList.toggle('in-game', s.status === 'playing');
+  if (s.status !== 'playing') document.body.classList.remove('table-expanded');
   const previousPositions = new Map(
     [...document.querySelectorAll('[data-token]')].map(node => [
       node.dataset.token,
-      node.getBoundingClientRect()
+      { rect: node.getBoundingClientRect(), position: previousState?.players.find(p => p.id === node.dataset.token)?.position }
     ])
   );
 
@@ -1286,44 +1352,42 @@ function render() {
     app.innerHTML = game();
   }
 
+  fitBoards();
   fillQR();
   connection();
 
   if (key && !$('#modal').open) {
-    const element = [...app.querySelectorAll('button')].find(
-      button =>
-        button.dataset.command === key ||
-        button.dataset.action === key
+    const element = [...app.querySelectorAll('button')].find(button =>
+      (button.dataset.command === key || button.dataset.action === key) &&
+      button.dataset.camera === focused.dataset.camera &&
+      button.dataset.index === focused.dataset.index &&
+      button.getClientRects().length
     );
 
     element?.focus({ preventScroll: true });
   }
 
-  if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  if (typeof Element.prototype.animate === 'function' && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
     for (const node of app.querySelectorAll('[data-token]')) {
-      const before = previousPositions.get(node.dataset.token);
+      const old = previousPositions.get(node.dataset.token);
+      const nextPosition = s.players.find(p => p.id === node.dataset.token)?.position;
+      if (!old || old.position === undefined || old.position === nextPosition) continue;
       const after = node.getBoundingClientRect();
-
-      if (
-        before &&
-        (
-          Math.abs(before.x - after.x) > 4 ||
-          Math.abs(before.y - after.y) > 4
-        )
-      ) {
-        node.animate([
-          {
-            translate:
-              `${before.x - after.x}px ${before.y - after.y}px`
-          },
-          { translate: '0 0' }
-        ], {
-          duration: 650,
-          easing: 'ease-in-out'
-        });
-      }
+      const ghost = document.createElement('span');
+      ghost.className = 'moving-piece';
+      ghost.innerHTML = node.querySelector('svg').outerHTML;
+      ghost.style.cssText = `left:${old.rect.x}px;top:${old.rect.y}px;width:${Math.max(after.width, 28)}px;height:${Math.max(after.height, 34)}px;color:${getComputedStyle(node).getPropertyValue('--token-color')}`;
+      document.body.append(ghost);
+      node.style.visibility = 'hidden';
+      const animation = ghost.animate([
+        { transform: 'translate(0,0) scale(.9)' },
+        { transform: `translate(${after.x - old.rect.x}px,${after.y - old.rect.y}px) scale(1)` }
+      ], { duration: 650, easing: 'cubic-bezier(.25,.65,.2,1)' });
+      animation.onfinish = animation.oncancel = () => { ghost.remove(); node.style.visibility = ''; };
     }
   }
+  lastRenderedState = JSON.parse(JSON.stringify(s));
+  syncEvent(previousState);
 
   if (modalKind === 'property' && selected !== null) {
     property(selected);
@@ -1360,14 +1424,13 @@ async function command(type, extra = {}, id) {
       busy = false;
       render();
     } else {
+      busy = true;
       ws.send(JSON.stringify({
         type: 'command',
         rev: s.rev,
         actor: id,
         command: { type, ...extra }
       }));
-
-      busy = false;
     }
   } catch (error) {
     busy = false;
@@ -1961,6 +2024,8 @@ function connectSocket() {
       }
 
       if (data.type === 'error') {
+        busy = false;
+        if (s) render();
         toast(data.message);
 
         if (!authenticated) {
@@ -2170,8 +2235,36 @@ async function action(name, element) {
 
     case 'camera':
       camera = element.dataset.camera;
+      zoom = 1;
+      boardPan = { x: 0, y: 0 };
       store('mtv-camera', camera);
       render();
+      break;
+
+    case 'zoom-in':
+    case 'zoom-out':
+    case 'zoom-reset':
+      zoom = name === 'zoom-reset' ? 1 : Math.max(0.8, Math.min(2, Math.round((zoom + (name === 'zoom-in' ? 0.2 : -0.2)) * 10) / 10));
+      boardPan = { x: 0, y: 0 };
+      render();
+      break;
+
+    case 'fullscreen': {
+      document.body.classList.toggle('table-expanded');
+      camera = 'flat';
+      zoom = 1;
+      boardPan = { x: 0, y: 0 };
+      window.scrollTo(0, 0);
+      render();
+      break;
+    }
+
+    case 'event':
+      eventCard();
+      break;
+
+    case 'close-event':
+      closeModal();
       break;
 
     case 'pause':
@@ -2246,7 +2339,7 @@ async function action(name, element) {
 document.addEventListener('click', async event => {
   const element = event.target.closest('button');
 
-  if (!element || element.disabled) return;
+  if (!element || element.disabled || (suppressBoardClick && element.closest('.stage'))) return;
 
   if (element.dataset.command) {
     const type = element.dataset.command;
@@ -2423,7 +2516,11 @@ document.addEventListener('submit', async event => {
 
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
-    closeModal();
+    if ($('#modal').open) closeModal();
+    else if (document.body.classList.contains('table-expanded')) {
+      document.body.classList.remove('table-expanded');
+      render();
+    }
     return;
   }
 
@@ -2498,7 +2595,8 @@ document.addEventListener('keydown', event => {
       }
     }
 
-    best?.focus();
+    if (best?.closest('.stage')) best.focus({ preventScroll: true });
+    else best?.focus();
   }
 
   if (!$('#modal').open && s?.status === 'playing') {
